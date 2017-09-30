@@ -49,7 +49,7 @@
 #define GTP_DRIVER_SEND_CFG   1
 #define GTP_HAVE_TOUCH_KEY    1
 #define GTP_POWER_CTRL_SLEEP  0
-#define GTP_ICS_SLOT_REPORT   0
+#define GTP_ICS_SLOT_REPORT   1
 
 #define GTP_COMPATIBLE_MODE   0    // compatible with GT9XXF
 
@@ -111,6 +111,7 @@ struct goodix_ts_data {
 
 	u8  ic_cfg_version;
 	u8	wakeup_gesture;
+	u8	wakeup_gesture_flag;
 /*ZTEMT END*/
 
     s32 irq_is_disable;
@@ -246,10 +247,16 @@ extern u8 gtp_cfg_version;	//move from .c file
   #define GTP_MAX_HEIGHT   800
   #define GTP_MAX_WIDTH    480
   #define GTP_INT_TRIGGER  0            // 0: Rising 1: Falling
-#else
-  #define GTP_MAX_HEIGHT   1280
-  #define GTP_MAX_WIDTH    720
-  #define GTP_INT_TRIGGER  1
+#endif
+
+#if defined (CONFIG_ZTEMT_GT9XX_5P0_INCH_GW_1080P)
+#define GTP_MAX_HEIGHT   1920
+#define GTP_MAX_WIDTH    1080
+#define GTP_INT_TRIGGER  1
+#elif defined (CONFIG_ZTEMT_GT9XX_5P0_INCH_GW_720P)
+#define GTP_MAX_HEIGHT	 1280
+#define GTP_MAX_WIDTH	 720
+#define GTP_INT_TRIGGER  1
 #endif
 #define GTP_MAX_TOUCH         5
 
@@ -313,11 +320,11 @@ extern u8 gtp_cfg_version;	//move from .c file
 
 #define CFG_GROUP_LEN(p_cfg_grp)  (sizeof(p_cfg_grp) / sizeof(p_cfg_grp[0]))
 // Log define
-#define GTP_INFO(fmt,arg...)           printk("<<-GTP-INFO->> "fmt"\n",##arg)
-#define GTP_ERROR(fmt,arg...)          printk("<<-GTP-ERROR->> "fmt"\n",##arg)
+#define GTP_INFO(fmt,arg...)           printk("<<-GTP-INFO->> %s "fmt"\n", __func__, ##arg)
+#define GTP_ERROR(fmt,arg...)          printk("<<-GTP-ERROR->> %s "fmt"\n", __func__, ##arg)
 #define GTP_DEBUG(fmt,arg...)          do{\
                                          if(GTP_DEBUG_ON)\
-                                         printk("<<-GTP-DEBUG->> [%d]"fmt"\n",__LINE__, ##arg);\
+                                         printk("<<-GTP-DEBUG->> %s [%d]"fmt"\n", __func__, __LINE__, ##arg);\
                                        }while(0)
 #define GTP_DEBUG_ARRAY(array, num)    do{\
                                          s32 i;\

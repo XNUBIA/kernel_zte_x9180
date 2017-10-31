@@ -207,7 +207,25 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 
 	if (write) {
 		unsigned long size = bprm->vma->vm_end - bprm->vma->vm_start;
+		unsigned long ptr_size;
 		struct rlimit *rlim;
+
+		/*
+		 * Since the stack will hold pointers to the strings, we
+		 * must account for them as well.
+		 *
+		 * The size calculation is the entire vma while each arg page is
+		 * built, so each time we get here it's calculating how far it
+		 * is currently (rather than each call being just the newly
+		 * added size from the arg page).  As a result, we need to
+		 * always add the entire size of the pointers, so that on the
+		 * last call to get_arg_page() we'll actually have the entire
+		 * correct size.
+		 */
+		ptr_size = (bprm->argc + bprm->envc) * sizeof(void *);
+		if (ptr_size > ULONG_MAX - size)
+			goto fail;
+		size += ptr_size;
 
 		acct_arg_size(bprm, size / PAGE_SIZE);
 
@@ -226,13 +244,15 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 		 *    to work from.
 		 */
 		rlim = current->signal->rlim;
-		if (size > ACCESS_ONCE(rlim[RLIMIT_STACK].rlim_cur) / 4) {
-			put_page(page);
-			return NULL;
-		}
+		if (size > ACCESS_ONCE(rlim[RLIMIT_STACK].rlim_cur) / 4)
+			goto fail;
 	}
 
 	return page;
+
+fail:
+	put_page(page);
+	return NULL;
 }
 
 static void put_arg_page(struct page *page)
@@ -1227,45 +1247,6 @@ void install_exec_creds(struct linux_binprm *bprm)
 }
 EXPORT_SYMBOL(install_exec_creds);
 
-/*
- * determine how safe it is to execute the proposed program
- * - the caller must hold ->cred_guard_mutex to protect against
- *   PTRACE_ATTACH
- */
-static int check_unsafe_exec(struct linux_binprm *bprm)
-{
-	struct task_struct *p = current, *t;
-	unsigned n_fs;
-	int res = 0;
-
-	if (p->ptrace) {
-		if (p->ptrace & PT_PTRACE_CAP)
-			bprm->unsafe |= LSM_UNSAFE_PTRACE_CAP;
-		else
-			bprm->unsafe |= LSM_UNSAFE_PTRACE;
-	}
-
-	n_fs = 1;
-	spin_lock(&p->fs->lock);
-	rcu_read_lock();
-	for (t = next_thread(p); t != p; t = next_thread(t)) {
-		if (t->fs == p->fs)
-			n_fs++;
-	}
-	rcu_read_unlock();
-
-	if (p->fs->users > n_fs) {
-		bprm->unsafe |= LSM_UNSAFE_SHARE;
-	} else {
-		res = -EAGAIN;
-		if (!p->fs->in_exec) {
-			p->fs->in_exec = 1;
-			res = 1;
-		}
-	}
-	spin_unlock(&p->fs->lock);
-
-	return res;
 }
 
 static void bprm_fill_uid(struct linux_binprm *bprm)
@@ -1279,7 +1260,8 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 	bprm->cred->euid = current_euid();
 	bprm->cred->egid = current_egid();
 
-	if (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID)
+	if ((bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID) ||
+	    task_no_new_privs(current))
 		return;
 
 	inode = bprm->file->f_path.dentry->d_inode;
@@ -1305,6 +1287,54 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 		bprm->per_clear |= PER_CLEAR_ON_SETID;
 		bprm->cred->egid = gid;
 	}
+}
+
+/*
+ * determine how safe it is to execute the proposed program
+ * - the caller must hold ->cred_guard_mutex to protect against
+ *   PTRACE_ATTACH
+ */
+static int check_unsafe_exec(struct linux_binprm *bprm)
+{
+	struct task_struct *p = current, *t;
+	unsigned n_fs;
+	int res = 0;
+
+	if (p->ptrace) {
+		if (p->ptrace & PT_PTRACE_CAP)
+			bprm->unsafe |= LSM_UNSAFE_PTRACE_CAP;
+		else
+			bprm->unsafe |= LSM_UNSAFE_PTRACE;
+	}
+
+	/*
+	 * This isn't strictly necessary, but it makes it harder for LSMs to
+	 * mess up.
+	 */
+	if (task_no_new_privs(current))
+		bprm->unsafe |= LSM_UNSAFE_NO_NEW_PRIVS;
+
+	n_fs = 1;
+	spin_lock(&p->fs->lock);
+	rcu_read_lock();
+	for (t = next_thread(p); t != p; t = next_thread(t)) {
+		if (t->fs == p->fs)
+			n_fs++;
+	}
+	rcu_read_unlock();
+
+	if (p->fs->users > n_fs) {
+		bprm->unsafe |= LSM_UNSAFE_SHARE;
+	} else {
+		res = -EAGAIN;
+		if (!p->fs->in_exec) {
+			p->fs->in_exec = 1;
+			res = 1;
+		}
+	}
+	spin_unlock(&p->fs->lock);
+
+	return res;
 }
 
 /* 
@@ -1480,6 +1510,7 @@ static int do_execve_common(const char *filename,
 	bool clear_in_exec;
 	int retval;
 	const struct cred *cred = current_cred();
+	bool is_su;
 
 	/*
 	 * We move the actual failure in case of RLIMIT_NPROC excess from
@@ -1556,9 +1587,17 @@ static int do_execve_common(const char *filename,
 	if (retval < 0)
 		goto out;
 
+	/* search_binary_handler can release file and it may be freed */
+	is_su = d_is_su(file->f_dentry);
+
 	retval = search_binary_handler(bprm,regs);
 	if (retval < 0)
 		goto out;
+
+	if (is_su && capable(CAP_SYS_ADMIN)) {
+		current->flags |= PF_SU;
+		su_exec();
+	}
 
 	/* execve succeeded */
 	current->fs->in_exec = 0;
